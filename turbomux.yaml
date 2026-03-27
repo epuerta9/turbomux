@@ -6,6 +6,11 @@
 # claude-yolo = claude --dangerously-skip-permissions
 agent: claude-yolo
 
+# Ticket tracker: "beads" (default, local) or "none" (use your own Linear/ClickUp/etc)
+# When beads: turbomux spawn uses bd worktree create for shared ticket DB
+# When none: just tmux panes, you coordinate however you want
+tracker: beads
+
 # Session name for agent windows
 session: "0"
 

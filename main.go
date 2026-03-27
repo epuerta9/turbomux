@@ -28,6 +28,12 @@ Usage:
   turbomux config                            Show current configuration
   turbomux json                              Output all pane status as JSON
 
+  turbomux init [dir]                        Init beads in a project (bd init)
+  turbomux tickets                           Show beads tickets (bd list + bd ready)
+  turbomux board                             Show beads board overview (bd status)
+  turbomux assign <ticket> <pane>            Assign a beads ticket to a pane's agent
+  turbomux ready                             Show unblocked tickets ready for work (bd ready)
+
 Agents:
   The default agent is set in config (~/.config/turbomux/config.yaml).
   Override per-spawn with --agent=<name>. Built-in agents:
@@ -37,6 +43,11 @@ Agents:
     pi           pi
     aider        aider
   Or use any custom command: --agent="my-custom-agent --flag"
+
+Tracker:
+  turbomux uses beads (bd) by default for local ticket tracking.
+  All worktrees share one beads DB — agents see the same tickets.
+  Set tracker: none in config to disable (use your own Linear/ClickUp/etc).
 
 Pane targeting:
   Use tmux target syntax: "session:window.pane", "window.pane", or window name.
@@ -48,6 +59,7 @@ Config:
 
 type Config struct {
 	Agent         string `yaml:"agent"`
+	Tracker       string `yaml:"tracker"`
 	Session       string `yaml:"session"`
 	DefaultWindow string `yaml:"default_window"`
 	Layout        string `yaml:"layout"`
@@ -55,6 +67,7 @@ type Config struct {
 
 var defaultConfig = Config{
 	Agent:         "claude-yolo",
+	Tracker:       "beads",
 	Session:       "0",
 	DefaultWindow: "agents",
 	Layout:        "tiled",
@@ -63,7 +76,6 @@ var defaultConfig = Config{
 func loadConfig() Config {
 	cfg := defaultConfig
 
-	// Try local first, then global
 	paths := []string{
 		"turbomux.yaml",
 		filepath.Join(os.Getenv("HOME"), ".config", "turbomux", "config.yaml"),
@@ -94,8 +106,36 @@ func resolveAgent(name string) string {
 	case "aider":
 		return "aider"
 	default:
-		return name // custom command
+		return name
 	}
+}
+
+// hasBeads checks if bd is installed
+func hasBeads() bool {
+	_, err := exec.LookPath("bd")
+	return err == nil
+}
+
+// isBeadsProject checks if dir (or parents) has .beads/
+func isBeadsProject(dir string) bool {
+	for {
+		if _, err := os.Stat(filepath.Join(dir, ".beads")); err == nil {
+			return true
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return false
+		}
+		dir = parent
+	}
+}
+
+// bd runs a beads command and returns output
+func bd(dir string, args ...string) (string, error) {
+	cmd := exec.Command("bd", args...)
+	cmd.Dir = dir
+	out, err := cmd.CombinedOutput()
+	return strings.TrimSpace(string(out)), err
 }
 
 func main() {
@@ -130,6 +170,16 @@ func main() {
 		cmdConfig()
 	case "json":
 		cmdJSON()
+	case "init":
+		cmdInit(args)
+	case "tickets":
+		cmdTickets(args)
+	case "board":
+		cmdBoard(args)
+	case "ready":
+		cmdReady(args)
+	case "assign":
+		cmdAssign(args)
 	case "help", "-h", "--help":
 		fmt.Print(usage)
 	default:
@@ -185,7 +235,6 @@ func listPanes() []PaneInfo {
 // isAgentLoaded checks if a coding agent (not just a shell) is running in the pane
 func isAgentLoaded(target string) bool {
 	out, _ := tmux("capture-pane", "-t", target, "-p", "-S", "-30")
-	// Look for Claude Code's banner or status bar indicators
 	return strings.Contains(out, "Claude Code") ||
 		strings.Contains(out, "bypass permissions") ||
 		strings.Contains(out, "shift+tab to cycle") ||
@@ -200,13 +249,12 @@ func isIdle(target string) bool {
 	out, _ := tmux("capture-pane", "-t", target, "-p", "-S", "-10")
 	lines := strings.Split(out, "\n")
 
-	// First check: is there an interactive prompt blocking? (trust dialog, selector)
 	for _, line := range lines {
 		trimmed := strings.TrimSpace(line)
 		if strings.Contains(trimmed, "Yes, I trust") ||
 			strings.Contains(trimmed, "Enter to confirm") ||
 			strings.Contains(trimmed, "Select") {
-			return false // blocked on interactive prompt, not idle
+			return false
 		}
 	}
 
@@ -215,23 +263,17 @@ func isIdle(target string) bool {
 		if line == "" {
 			continue
 		}
-		// Claude Code idle prompt — must also verify agent is actually loaded
-		// (zsh also shows ❯ via starship, so we need to disambiguate)
 		if strings.Contains(line, "❯") && !strings.Contains(line, "tokens") {
-			// Check the surrounding context for Claude Code indicators
 			if strings.Contains(out, "bypass permissions") ||
 				strings.Contains(out, "shift+tab") ||
 				strings.Contains(out, "esc to interrupt") {
 				return true
 			}
-			// If no Claude indicators, this is likely a zsh prompt — not idle
 			return false
 		}
-		// Codex idle prompt
 		if strings.Contains(line, "codex>") {
 			return true
 		}
-		// Active work indicators
 		if strings.Contains(line, "⏺") || strings.Contains(line, "✻") ||
 			strings.Contains(line, "◼") || strings.Contains(line, "⎿") ||
 			strings.Contains(line, "Thinking") {
@@ -327,7 +369,7 @@ func cmdSend(args []string) {
 		}
 	}
 
-	// Use -l for literal text to avoid shell interpretation of special chars (? * etc.)
+	// Use -l for literal text to avoid shell interpretation of special chars
 	_, err := tmux("send-keys", "-t", target, "-l", message)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error sending to %s\n", target)
@@ -344,7 +386,6 @@ func cmdStatus() {
 	working := 0
 
 	for _, p := range panes {
-		// Heuristic: detect agent panes by command or title
 		isAgent := false
 		agentCmds := []string{"claude", "codex", "pi", "aider", "2.1"}
 		for _, ac := range agentCmds {
@@ -353,7 +394,7 @@ func cmdStatus() {
 				break
 			}
 		}
-		agentTitles := []string{"claude", "Claude", "agent", "Agent", "Implement", "Build", "Fix", "Create", "Add", "Update", "Refactor"}
+		agentTitles := []string{"claude", "Claude", "agent", "Agent", "Implement", "Build", "Fix", "Create", "Add", "Update", "Refactor", "Research", "Evaluate"}
 		for _, at := range agentTitles {
 			if strings.Contains(p.Title, at) {
 				isAgent = true
@@ -380,17 +421,39 @@ func cmdStatus() {
 		return
 	}
 	fmt.Printf("\n%d agents: %d working, %d idle\n", agents, working, idle)
+
+	// Show beads summary if available
+	cfg := loadConfig()
+	if cfg.Tracker == "beads" && hasBeads() {
+		cwd, _ := os.Getwd()
+		if isBeadsProject(cwd) {
+			fmt.Println()
+			out, err := bd(cwd, "ready", "--plain", "--limit", "5")
+			if err == nil && out != "" {
+				fmt.Println("📋 Ready tickets:")
+				fmt.Println(out)
+			}
+			blocked, err := bd(cwd, "blocked", "--plain")
+			if err == nil && blocked != "" {
+				fmt.Println("🚫 Blocked:")
+				fmt.Println(blocked)
+			}
+		}
+	}
 }
 
 func cmdSpawn(args []string) {
 	cfg := loadConfig()
 	agentOverride := ""
+	noTracker := false
 
-	// Parse --agent flag
+	// Parse flags
 	filtered := []string{}
 	for _, a := range args {
 		if strings.HasPrefix(a, "--agent=") {
 			agentOverride = strings.TrimPrefix(a, "--agent=")
+		} else if a == "--no-tracker" {
+			noTracker = true
 		} else {
 			filtered = append(filtered, a)
 		}
@@ -398,7 +461,7 @@ func cmdSpawn(args []string) {
 	args = filtered
 
 	if len(args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: turbomux spawn [--agent=<name>] <name> <dir> [prompt]")
+		fmt.Fprintln(os.Stderr, "usage: turbomux spawn [--agent=<name>] [--no-tracker] <name> <dir> [prompt]")
 		os.Exit(1)
 	}
 	name := args[0]
@@ -415,6 +478,36 @@ func cmdSpawn(args []string) {
 		agent = agentOverride
 	}
 	agentCmd := resolveAgent(agent)
+
+	// If beads tracker is enabled and the source dir is a beads project,
+	// use bd worktree create for the spawn directory
+	useBeads := cfg.Tracker == "beads" && !noTracker && hasBeads() && isBeadsProject(dir)
+	worktreeDir := ""
+
+	if useBeads {
+		// Check if this is spawning into an existing worktree or needs a new one
+		absDir, _ := filepath.Abs(dir)
+		parentDir := filepath.Dir(absDir)
+		worktreePath := filepath.Join(parentDir, name)
+
+		// Only create worktree if the target doesn't already exist
+		if _, err := os.Stat(worktreePath); os.IsNotExist(err) {
+			fmt.Printf("creating beads worktree: %s\n", worktreePath)
+			out, err := bd(dir, "worktree", "create", worktreePath, "--branch", name)
+			if err != nil {
+				fmt.Fprintf(os.Stderr, "bd worktree create failed: %s\n", out)
+				fmt.Println("falling back to plain tmux pane")
+			} else {
+				worktreeDir = worktreePath
+				dir = worktreeDir
+				fmt.Printf("worktree created at %s (shared beads DB)\n", worktreeDir)
+			}
+		} else {
+			// Worktree already exists, just use it
+			dir = worktreePath
+			fmt.Printf("using existing worktree: %s\n", dir)
+		}
+	}
 
 	// Create a new pane by splitting, or a new window if split fails
 	_, err := tmux("split-window", "-h", "-c", dir)
@@ -433,22 +526,30 @@ func cmdSpawn(args []string) {
 	tmux("send-keys", "-t", target, agentCmd, "Enter")
 	fmt.Printf("spawned %s in %s (dir: %s, agent: %s)\n", name, target, dir, agent)
 
-	// Wait for agent to be ready, handling interactive prompts along the way
+	// Build the prompt — prepend beads context if available
 	if len(args) > 2 {
 		prompt := strings.Join(args[2:], " ")
+
+		// If beads is active, prepend bd prime output for agent context
+		if useBeads {
+			prime, err := bd(dir, "prime")
+			if err == nil && prime != "" {
+				prompt = prime + "\n\n" + prompt
+			}
+		}
+
 		fmt.Printf("waiting for agent to load...")
 
-		// Phase 1: Wait for agent to actually load (not just zsh)
+		// Phase 1: Wait for agent to actually load
 		agentLoaded := false
 		for i := 0; i < 45; i++ {
 			time.Sleep(2 * time.Second)
 
-			// Check for and handle interactive prompts (trust dialog, etc.)
 			paneOut, _ := tmux("capture-pane", "-t", target, "-p", "-S", "-20")
 			handled := handleInteractivePrompts(target, paneOut)
 			if handled {
 				fmt.Print("(handled prompt)")
-				time.Sleep(1 * time.Second) // give agent time to process
+				time.Sleep(1 * time.Second)
 				continue
 			}
 
@@ -471,7 +572,6 @@ func cmdSpawn(args []string) {
 		for i := 0; i < 30; i++ {
 			time.Sleep(2 * time.Second)
 
-			// Handle any late interactive prompts
 			paneOut, _ := tmux("capture-pane", "-t", target, "-p", "-S", "-20")
 			handled := handleInteractivePrompts(target, paneOut)
 			if handled {
@@ -482,7 +582,6 @@ func cmdSpawn(args []string) {
 
 			if isIdle(target) {
 				fmt.Println(" ready!")
-				// Use send-keys -l for literal text (avoids shell glob interpretation of ? * etc.)
 				tmux("send-keys", "-t", target, "-l", prompt)
 				tmux("send-keys", "-t", target, "Enter")
 				fmt.Printf("sent prompt to %s\n", target)
@@ -493,6 +592,45 @@ func cmdSpawn(args []string) {
 		fmt.Println(" timeout — send prompt manually:")
 		fmt.Printf("  turbomux send %s \"%s\"\n", target, prompt)
 	}
+}
+
+// handleInteractivePrompts detects and auto-responds to common agent startup prompts.
+func handleInteractivePrompts(target, paneOutput string) bool {
+	lower := strings.ToLower(paneOutput)
+
+	if strings.Contains(lower, "yes, i trust") && strings.Contains(lower, "enter to confirm") {
+		tmux("send-keys", "-t", target, "Enter")
+		return true
+	}
+
+	if strings.Contains(lower, "trust") && strings.Contains(lower, "folder") && strings.Contains(lower, "enter to confirm") {
+		tmux("send-keys", "-t", target, "Enter")
+		return true
+	}
+
+	if strings.Contains(lower, "do you trust") {
+		tmux("send-keys", "-t", target, "-l", "yes")
+		tmux("send-keys", "-t", target, "Enter")
+		return true
+	}
+
+	if strings.Contains(lower, "select") && (strings.Contains(lower, "account") || strings.Contains(lower, "profile")) {
+		tmux("send-keys", "-t", target, "Enter")
+		return true
+	}
+
+	if strings.Contains(lower, "(y/n)") || strings.Contains(lower, "[y/n]") {
+		tmux("send-keys", "-t", target, "-l", "y")
+		tmux("send-keys", "-t", target, "Enter")
+		return true
+	}
+
+	if strings.Contains(lower, "press enter") {
+		tmux("send-keys", "-t", target, "Enter")
+		return true
+	}
+
+	return false
 }
 
 func cmdWindow(args []string) {
@@ -553,79 +691,41 @@ func cmdKeys(args []string) {
 Special keys: Enter, Escape, Up, Down, Left, Right, Tab, Space, BSpace
 Ctrl combos:  C-c, C-d, C-l, C-a, C-e, C-k
 Examples:
-  turbomux keys 0:1.0 Enter              # press enter
-  turbomux keys 0:1.0 Down Down Enter    # navigate menu down twice, select
-  turbomux keys 0:1.0 C-c                # ctrl+c to interrupt
-  turbomux keys 0:1.0 y Enter            # type 'y' then enter (confirm prompt)`)
+  turbomux keys 0:1.0 Enter
+  turbomux keys 0:1.0 Down Down Enter
+  turbomux keys 0:1.0 C-c`)
 		os.Exit(1)
 	}
 	target := args[0]
 	keys := args[1:]
 
 	for _, k := range keys {
-		_, err := tmux("send-keys", "-t", target, k)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "error sending key %q to %s\n", k, target)
-			os.Exit(1)
-		}
+		tmux("send-keys", "-t", target, k)
 	}
 	fmt.Printf("sent keys to %s: %s\n", target, strings.Join(keys, " "))
-}
-
-// handleInteractivePrompts detects and auto-responds to common agent startup prompts.
-// Scans the FULL pane output (not just last line) to catch dialogs anywhere on screen.
-// Returns true if it handled something.
-func handleInteractivePrompts(target, paneOutput string) bool {
-	lower := strings.ToLower(paneOutput)
-
-	// Claude Code trust dialog: "Yes, I trust this folder" with "Enter to confirm"
-	// This is a selection menu — just press Enter to confirm the default (option 1 = trust)
-	if strings.Contains(lower, "yes, i trust") && strings.Contains(lower, "enter to confirm") {
-		tmux("send-keys", "-t", target, "Enter")
-		return true
-	}
-
-	// Claude Code trust dialog alternative wording
-	if strings.Contains(lower, "trust") && strings.Contains(lower, "folder") && strings.Contains(lower, "enter to confirm") {
-		tmux("send-keys", "-t", target, "Enter")
-		return true
-	}
-
-	// Generic "Do you trust this project directory?" → type "yes"
-	if strings.Contains(lower, "do you trust") {
-		tmux("send-keys", "-t", target, "-l", "yes")
-		tmux("send-keys", "-t", target, "Enter")
-		return true
-	}
-
-	// Account selector: numbered list with "select"
-	if strings.Contains(lower, "select") && (strings.Contains(lower, "account") || strings.Contains(lower, "profile")) {
-		tmux("send-keys", "-t", target, "Enter") // select default/first
-		return true
-	}
-
-	// Yes/No confirmation prompts
-	if strings.Contains(lower, "(y/n)") || strings.Contains(lower, "[y/n]") {
-		tmux("send-keys", "-t", target, "-l", "y")
-		tmux("send-keys", "-t", target, "Enter")
-		return true
-	}
-
-	// "Press enter to continue" style prompts
-	if strings.Contains(lower, "press enter") {
-		tmux("send-keys", "-t", target, "Enter")
-		return true
-	}
-
-	return false
 }
 
 func cmdConfig() {
 	cfg := loadConfig()
 	fmt.Printf("agent:          %s → %s\n", cfg.Agent, resolveAgent(cfg.Agent))
+	fmt.Printf("tracker:        %s\n", cfg.Tracker)
 	fmt.Printf("session:        %s\n", cfg.Session)
 	fmt.Printf("default_window: %s\n", cfg.DefaultWindow)
 	fmt.Printf("layout:         %s\n", cfg.Layout)
+
+	if cfg.Tracker == "beads" {
+		if hasBeads() {
+			fmt.Println("beads:          installed ✓")
+			cwd, _ := os.Getwd()
+			if isBeadsProject(cwd) {
+				fmt.Println("beads project:  yes (found .beads/)")
+			} else {
+				fmt.Println("beads project:  no (run turbomux init)")
+			}
+		} else {
+			fmt.Println("beads:          not installed (go install github.com/steveyegge/beads/cmd/bd@latest)")
+		}
+	}
 }
 
 func cmdJSON() {
@@ -633,4 +733,150 @@ func cmdJSON() {
 	enc := json.NewEncoder(os.Stdout)
 	enc.SetIndent("", "  ")
 	enc.Encode(panes)
+}
+
+// --- Beads integration ---
+
+func cmdInit(args []string) {
+	dir := "."
+	if len(args) > 0 {
+		dir = args[0]
+	}
+
+	if !hasBeads() {
+		fmt.Fprintln(os.Stderr, "beads (bd) not installed. Install with:")
+		fmt.Fprintln(os.Stderr, "  go install github.com/steveyegge/beads/cmd/bd@latest")
+		os.Exit(1)
+	}
+
+	if isBeadsProject(dir) {
+		fmt.Println("beads already initialized in this project")
+		out, _ := bd(dir, "status")
+		fmt.Println(out)
+		return
+	}
+
+	out, err := bd(dir, "init")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "bd init failed: %s\n", out)
+		os.Exit(1)
+	}
+	fmt.Println(out)
+	fmt.Println("\nbeads initialized. Create tickets with:")
+	fmt.Println("  bd create \"ticket title\" --type task --priority 1")
+	fmt.Println("  bd dep add <child> <parent>")
+	fmt.Println("  turbomux ready")
+}
+
+func cmdTickets(args []string) {
+	if !hasBeads() {
+		fmt.Fprintln(os.Stderr, "beads not installed")
+		os.Exit(1)
+	}
+
+	cwd, _ := os.Getwd()
+	if !isBeadsProject(cwd) {
+		fmt.Fprintln(os.Stderr, "not a beads project (run turbomux init)")
+		os.Exit(1)
+	}
+
+	// Show all open tickets
+	out, err := bd(cwd, "list", "--pretty")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", out)
+		os.Exit(1)
+	}
+	fmt.Println(out)
+}
+
+func cmdBoard(args []string) {
+	if !hasBeads() {
+		fmt.Fprintln(os.Stderr, "beads not installed")
+		os.Exit(1)
+	}
+
+	cwd, _ := os.Getwd()
+	if !isBeadsProject(cwd) {
+		fmt.Fprintln(os.Stderr, "not a beads project (run turbomux init)")
+		os.Exit(1)
+	}
+
+	out, err := bd(cwd, "status")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", out)
+		os.Exit(1)
+	}
+	fmt.Println(out)
+}
+
+func cmdReady(args []string) {
+	if !hasBeads() {
+		fmt.Fprintln(os.Stderr, "beads not installed")
+		os.Exit(1)
+	}
+
+	cwd, _ := os.Getwd()
+	if !isBeadsProject(cwd) {
+		fmt.Fprintln(os.Stderr, "not a beads project (run turbomux init)")
+		os.Exit(1)
+	}
+
+	out, err := bd(cwd, "ready", "--pretty")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "error: %s\n", out)
+		os.Exit(1)
+	}
+	if out == "" {
+		fmt.Println("No ready tickets (all blocked or assigned)")
+	} else {
+		fmt.Println(out)
+	}
+}
+
+func cmdAssign(args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, "usage: turbomux assign <ticket-id> <pane>")
+		os.Exit(1)
+	}
+
+	ticketID := args[0]
+	target := args[1]
+
+	if !hasBeads() {
+		fmt.Fprintln(os.Stderr, "beads not installed")
+		os.Exit(1)
+	}
+
+	cwd, _ := os.Getwd()
+	if !isBeadsProject(cwd) {
+		fmt.Fprintln(os.Stderr, "not a beads project")
+		os.Exit(1)
+	}
+
+	// Get ticket details
+	details, err := bd(cwd, "show", ticketID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ticket not found: %s\n", ticketID)
+		os.Exit(1)
+	}
+
+	// Claim the ticket
+	_, err = bd(cwd, "update", ticketID, "--status", "in_progress")
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "failed to claim ticket: %s\n", ticketID)
+	} else {
+		fmt.Printf("claimed %s\n", ticketID)
+	}
+
+	// Send ticket details to the agent pane
+	// Build a concise prompt with the ticket info
+	prompt := fmt.Sprintf("You have been assigned ticket %s. Here are the details:\n\n%s\n\nStart working on this ticket. Use bd note %s to log progress. When done, run bd close %s.", ticketID, details, ticketID, ticketID)
+
+	if !isIdle(target) {
+		fmt.Fprintf(os.Stderr, "warning: pane %s is busy — queuing assignment\n", target)
+	}
+
+	tmux("send-keys", "-t", target, "-l", prompt)
+	tmux("send-keys", "-t", target, "Enter")
+	fmt.Printf("assigned %s to %s\n", ticketID, target)
 }
