@@ -56,21 +56,31 @@ turbomux window agents 3
 
 # Kill a pane
 turbomux kill 0:2.1
+
+# Send special keys (navigate menus, confirm prompts, interrupt)
+turbomux keys 0:1.0 Down Down Enter    # navigate a selector
+turbomux keys 0:1.0 y Enter            # confirm a yes/no prompt
+turbomux keys 0:1.0 C-c                # ctrl+c to interrupt
 ```
 
 ## Agent Configuration
 
-By default, turbomux launches `claude --dangerously-skip-permissions` (`cc`). Change this in your config:
+By default, turbomux launches `claude --dangerously-skip-permissions`. Change this in your config:
 
 ```bash
 mkdir -p ~/.config/turbomux
 cat > ~/.config/turbomux/config.yaml << 'EOF'
 # Default coding agent
-agent: cc
+agent: claude-yolo
 
-# Options: cc, claude, codex, pi, aider, or any custom command
-# agent: codex
-# agent: "my-agent --custom-flag"
+# Built-in agents:
+#   claude-yolo  = claude --dangerously-skip-permissions (default)
+#   claude       = claude (with permission prompts)
+#   codex        = codex
+#   pi           = pi
+#   aider        = aider
+# Or any custom command:
+#   agent: "my-agent --custom-flag"
 
 # tmux session name
 session: "0"
@@ -102,8 +112,30 @@ turbomux spawn --agent="aider --model gpt-4" refactor ~/projects/lib
 | `turbomux spawn [--agent=X] <name> <dir> [prompt]` | Create pane, launch agent, send prompt |
 | `turbomux window <name> <count>` | Create named window with N panes |
 | `turbomux kill <pane>` | Kill a pane or window |
+| `turbomux keys <pane> <key...>` | Send special keys (Enter, Up, Down, C-c, etc.) |
 | `turbomux config` | Show current configuration |
 | `turbomux json` | Machine-readable JSON of all panes |
+
+## Interactive Prompt Handling
+
+When spawning agents, turbomux auto-handles common startup prompts:
+
+- **"Do you trust this project directory?"** → auto-accepts
+- **"Select account"** → selects the default (first) option
+- **Yes/No confirmations** → auto-confirms
+- **"Press enter to continue"** → presses enter
+
+For anything else, use `turbomux keys` to navigate manually:
+```bash
+# Navigate a dropdown selector
+turbomux keys 0:1.0 Down Down Enter
+
+# Dismiss a dialog
+turbomux keys 0:1.0 Escape
+
+# Type into an interactive prompt
+turbomux keys 0:1.0 m y p a s s w o r d Enter
+```
 
 ## Pane Targeting
 

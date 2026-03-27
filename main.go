@@ -24,17 +24,18 @@ Usage:
   turbomux spawn --agent=codex <name> <dir>  Use a specific agent (overrides config)
   turbomux window <name> <count>             Create named window with N panes
   turbomux kill <pane>                       Kill a pane or window
+  turbomux keys <pane> <key...>              Send special keys (Enter, Escape, Up, Down, Tab, C-c, etc.)
   turbomux config                            Show current configuration
   turbomux json                              Output all pane status as JSON
 
 Agents:
   The default agent is set in config (~/.config/turbomux/config.yaml).
   Override per-spawn with --agent=<name>. Built-in agents:
-    cc       claude --dangerously-skip-permissions (default)
-    claude   claude (with permission prompts)
-    codex    codex
-    pi       pi
-    aider    aider
+    claude-yolo  claude --dangerously-skip-permissions (default)
+    claude       claude (with permission prompts)
+    codex        codex
+    pi           pi
+    aider        aider
   Or use any custom command: --agent="my-custom-agent --flag"
 
 Pane targeting:
@@ -53,7 +54,7 @@ type Config struct {
 }
 
 var defaultConfig = Config{
-	Agent:         "cc",
+	Agent:         "claude-yolo",
 	Session:       "0",
 	DefaultWindow: "agents",
 	Layout:        "tiled",
@@ -82,7 +83,7 @@ func loadConfig() Config {
 
 func resolveAgent(name string) string {
 	switch name {
-	case "cc":
+	case "claude-yolo":
 		return "claude --dangerously-skip-permissions"
 	case "claude":
 		return "claude"
@@ -123,6 +124,8 @@ func main() {
 		cmdWindow(args)
 	case "kill":
 		cmdKill(args)
+	case "keys":
+		cmdKeys(args)
 	case "config":
 		cmdConfig()
 	case "json":
@@ -395,13 +398,21 @@ func cmdSpawn(args []string) {
 	tmux("send-keys", "-t", target, agentCmd, "Enter")
 	fmt.Printf("spawned %s in %s (dir: %s, agent: %s)\n", name, target, dir, agent)
 
-	// If prompt provided, wait for agent to start then send it
+	// Wait for agent to be ready, handling interactive prompts along the way
 	if len(args) > 2 {
 		prompt := strings.Join(args[2:], " ")
 		fmt.Printf("waiting for agent to start...")
-		// Poll for idle state (agent ready for input)
 		for i := 0; i < 30; i++ {
 			time.Sleep(2 * time.Second)
+
+			// Check pane output for interactive prompts
+			paneOut, _ := tmux("capture-pane", "-t", target, "-p", "-S", "-15")
+			handled := handleInteractivePrompts(target, paneOut)
+			if handled {
+				fmt.Print("(handled prompt)")
+				continue // re-check after handling
+			}
+
 			if isIdle(target) {
 				fmt.Println(" ready!")
 				tmux("send-keys", "-t", target, prompt, "Enter")
@@ -464,6 +475,73 @@ func cmdKill(args []string) {
 		return
 	}
 	fmt.Printf("killed pane %s\n", target)
+}
+
+func cmdKeys(args []string) {
+	if len(args) < 2 {
+		fmt.Fprintln(os.Stderr, `usage: turbomux keys <pane> <key...>
+
+Special keys: Enter, Escape, Up, Down, Left, Right, Tab, Space, BSpace
+Ctrl combos:  C-c, C-d, C-l, C-a, C-e, C-k
+Examples:
+  turbomux keys 0:1.0 Enter              # press enter
+  turbomux keys 0:1.0 Down Down Enter    # navigate menu down twice, select
+  turbomux keys 0:1.0 C-c                # ctrl+c to interrupt
+  turbomux keys 0:1.0 y Enter            # type 'y' then enter (confirm prompt)`)
+		os.Exit(1)
+	}
+	target := args[0]
+	keys := args[1:]
+
+	for _, k := range keys {
+		_, err := tmux("send-keys", "-t", target, k)
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "error sending key %q to %s\n", k, target)
+			os.Exit(1)
+		}
+	}
+	fmt.Printf("sent keys to %s: %s\n", target, strings.Join(keys, " "))
+}
+
+// handleInteractivePrompts detects and auto-responds to common agent startup prompts.
+// Returns true if it handled something.
+func handleInteractivePrompts(target, paneOutput string) bool {
+	lines := strings.Split(paneOutput, "\n")
+	// Scan bottom-up for known prompts
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := strings.ToLower(strings.TrimSpace(lines[i]))
+		if line == "" {
+			continue
+		}
+
+		// Claude Code: "Do you trust this project directory?" → type "yes" + Enter
+		if strings.Contains(line, "trust") && (strings.Contains(line, "directory") || strings.Contains(line, "project")) {
+			tmux("send-keys", "-t", target, "yes", "Enter")
+			return true
+		}
+
+		// Claude Code: "Yes / No" confirmation prompts
+		if (strings.Contains(line, "yes") && strings.Contains(line, "no")) ||
+			strings.Contains(line, "(y/n)") || strings.Contains(line, "[y/n]") {
+			tmux("send-keys", "-t", target, "y", "Enter")
+			return true
+		}
+
+		// Account selector: if we see numbered list items, select the first
+		if strings.Contains(line, "select") && strings.Contains(line, "account") {
+			tmux("send-keys", "-t", target, "Enter") // select default/first
+			return true
+		}
+
+		// "Press enter to continue" style prompts
+		if strings.Contains(line, "press enter") || strings.Contains(line, "continue") {
+			tmux("send-keys", "-t", target, "Enter")
+			return true
+		}
+
+		break // only check the last non-empty line
+	}
+	return false
 }
 
 func cmdConfig() {

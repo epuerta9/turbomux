@@ -2,8 +2,9 @@
 # Place at ~/.config/turbomux/config.yaml or ./turbomux.yaml
 
 # Default coding agent command to launch in new panes
-# Options: "cc" (claude --dangerously-skip-permissions), "claude", "codex", "pi", custom command
-agent: cc
+# Options: "claude-yolo", "claude", "codex", "pi", "aider", or any custom command
+# claude-yolo = claude --dangerously-skip-permissions
+agent: claude-yolo
 
 # Session name for agent windows
 session: "0"
