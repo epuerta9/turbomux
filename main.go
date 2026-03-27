@@ -182,20 +182,53 @@ func listPanes() []PaneInfo {
 	return panes
 }
 
+// isAgentLoaded checks if a coding agent (not just a shell) is running in the pane
+func isAgentLoaded(target string) bool {
+	out, _ := tmux("capture-pane", "-t", target, "-p", "-S", "-30")
+	// Look for Claude Code's banner or status bar indicators
+	return strings.Contains(out, "Claude Code") ||
+		strings.Contains(out, "bypass permissions") ||
+		strings.Contains(out, "shift+tab to cycle") ||
+		strings.Contains(out, "esc to interrupt") ||
+		strings.Contains(out, "⏺") ||
+		strings.Contains(out, "✻") ||
+		strings.Contains(out, "codex>") ||
+		strings.Contains(out, "aider>")
+}
+
 func isIdle(target string) bool {
 	out, _ := tmux("capture-pane", "-t", target, "-p", "-S", "-10")
 	lines := strings.Split(out, "\n")
+
+	// First check: is there an interactive prompt blocking? (trust dialog, selector)
+	for _, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.Contains(trimmed, "Yes, I trust") ||
+			strings.Contains(trimmed, "Enter to confirm") ||
+			strings.Contains(trimmed, "Select") {
+			return false // blocked on interactive prompt, not idle
+		}
+	}
+
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
 		}
-		// Claude Code idle prompt
+		// Claude Code idle prompt — must also verify agent is actually loaded
+		// (zsh also shows ❯ via starship, so we need to disambiguate)
 		if strings.Contains(line, "❯") && !strings.Contains(line, "tokens") {
-			return true
+			// Check the surrounding context for Claude Code indicators
+			if strings.Contains(out, "bypass permissions") ||
+				strings.Contains(out, "shift+tab") ||
+				strings.Contains(out, "esc to interrupt") {
+				return true
+			}
+			// If no Claude indicators, this is likely a zsh prompt — not idle
+			return false
 		}
 		// Codex idle prompt
-		if strings.Contains(line, "codex>") || strings.Contains(line, "$ ") {
+		if strings.Contains(line, "codex>") {
 			return true
 		}
 		// Active work indicators
@@ -294,11 +327,13 @@ func cmdSend(args []string) {
 		}
 	}
 
-	_, err := tmux("send-keys", "-t", target, message, "Enter")
+	// Use -l for literal text to avoid shell interpretation of special chars (? * etc.)
+	_, err := tmux("send-keys", "-t", target, "-l", message)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error sending to %s\n", target)
 		os.Exit(1)
 	}
+	tmux("send-keys", "-t", target, "Enter")
 	fmt.Printf("sent to %s: %s\n", target, message)
 }
 
@@ -401,21 +436,55 @@ func cmdSpawn(args []string) {
 	// Wait for agent to be ready, handling interactive prompts along the way
 	if len(args) > 2 {
 		prompt := strings.Join(args[2:], " ")
-		fmt.Printf("waiting for agent to start...")
-		for i := 0; i < 30; i++ {
+		fmt.Printf("waiting for agent to load...")
+
+		// Phase 1: Wait for agent to actually load (not just zsh)
+		agentLoaded := false
+		for i := 0; i < 45; i++ {
 			time.Sleep(2 * time.Second)
 
-			// Check pane output for interactive prompts
-			paneOut, _ := tmux("capture-pane", "-t", target, "-p", "-S", "-15")
+			// Check for and handle interactive prompts (trust dialog, etc.)
+			paneOut, _ := tmux("capture-pane", "-t", target, "-p", "-S", "-20")
 			handled := handleInteractivePrompts(target, paneOut)
 			if handled {
 				fmt.Print("(handled prompt)")
-				continue // re-check after handling
+				time.Sleep(1 * time.Second) // give agent time to process
+				continue
+			}
+
+			if isAgentLoaded(target) {
+				agentLoaded = true
+				fmt.Print(" loaded!")
+				break
+			}
+			fmt.Print(".")
+		}
+
+		if !agentLoaded {
+			fmt.Println(" timeout waiting for agent to load")
+			fmt.Printf("  send prompt manually: turbomux send %s \"...\"\n", target)
+			return
+		}
+
+		// Phase 2: Wait for agent's idle prompt
+		fmt.Print(" waiting for prompt...")
+		for i := 0; i < 30; i++ {
+			time.Sleep(2 * time.Second)
+
+			// Handle any late interactive prompts
+			paneOut, _ := tmux("capture-pane", "-t", target, "-p", "-S", "-20")
+			handled := handleInteractivePrompts(target, paneOut)
+			if handled {
+				fmt.Print("(handled prompt)")
+				time.Sleep(1 * time.Second)
+				continue
 			}
 
 			if isIdle(target) {
 				fmt.Println(" ready!")
-				tmux("send-keys", "-t", target, prompt, "Enter")
+				// Use send-keys -l for literal text (avoids shell glob interpretation of ? * etc.)
+				tmux("send-keys", "-t", target, "-l", prompt)
+				tmux("send-keys", "-t", target, "Enter")
 				fmt.Printf("sent prompt to %s\n", target)
 				return
 			}
@@ -504,43 +573,50 @@ Examples:
 }
 
 // handleInteractivePrompts detects and auto-responds to common agent startup prompts.
+// Scans the FULL pane output (not just last line) to catch dialogs anywhere on screen.
 // Returns true if it handled something.
 func handleInteractivePrompts(target, paneOutput string) bool {
-	lines := strings.Split(paneOutput, "\n")
-	// Scan bottom-up for known prompts
-	for i := len(lines) - 1; i >= 0; i-- {
-		line := strings.ToLower(strings.TrimSpace(lines[i]))
-		if line == "" {
-			continue
-		}
+	lower := strings.ToLower(paneOutput)
 
-		// Claude Code: "Do you trust this project directory?" → type "yes" + Enter
-		if strings.Contains(line, "trust") && (strings.Contains(line, "directory") || strings.Contains(line, "project")) {
-			tmux("send-keys", "-t", target, "yes", "Enter")
-			return true
-		}
-
-		// Claude Code: "Yes / No" confirmation prompts
-		if (strings.Contains(line, "yes") && strings.Contains(line, "no")) ||
-			strings.Contains(line, "(y/n)") || strings.Contains(line, "[y/n]") {
-			tmux("send-keys", "-t", target, "y", "Enter")
-			return true
-		}
-
-		// Account selector: if we see numbered list items, select the first
-		if strings.Contains(line, "select") && strings.Contains(line, "account") {
-			tmux("send-keys", "-t", target, "Enter") // select default/first
-			return true
-		}
-
-		// "Press enter to continue" style prompts
-		if strings.Contains(line, "press enter") || strings.Contains(line, "continue") {
-			tmux("send-keys", "-t", target, "Enter")
-			return true
-		}
-
-		break // only check the last non-empty line
+	// Claude Code trust dialog: "Yes, I trust this folder" with "Enter to confirm"
+	// This is a selection menu — just press Enter to confirm the default (option 1 = trust)
+	if strings.Contains(lower, "yes, i trust") && strings.Contains(lower, "enter to confirm") {
+		tmux("send-keys", "-t", target, "Enter")
+		return true
 	}
+
+	// Claude Code trust dialog alternative wording
+	if strings.Contains(lower, "trust") && strings.Contains(lower, "folder") && strings.Contains(lower, "enter to confirm") {
+		tmux("send-keys", "-t", target, "Enter")
+		return true
+	}
+
+	// Generic "Do you trust this project directory?" → type "yes"
+	if strings.Contains(lower, "do you trust") {
+		tmux("send-keys", "-t", target, "-l", "yes")
+		tmux("send-keys", "-t", target, "Enter")
+		return true
+	}
+
+	// Account selector: numbered list with "select"
+	if strings.Contains(lower, "select") && (strings.Contains(lower, "account") || strings.Contains(lower, "profile")) {
+		tmux("send-keys", "-t", target, "Enter") // select default/first
+		return true
+	}
+
+	// Yes/No confirmation prompts
+	if strings.Contains(lower, "(y/n)") || strings.Contains(lower, "[y/n]") {
+		tmux("send-keys", "-t", target, "-l", "y")
+		tmux("send-keys", "-t", target, "Enter")
+		return true
+	}
+
+	// "Press enter to continue" style prompts
+	if strings.Contains(lower, "press enter") {
+		tmux("send-keys", "-t", target, "Enter")
+		return true
+	}
+
 	return false
 }
 
