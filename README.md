@@ -2,17 +2,23 @@
 
 Dead simple coding agent orchestration. No framework, no server, no SDK — just tmux.
 
-Spawn Claude Code, Codex, Pi, Aider, or any coding agent in tmux panes. Monitor them. Send them tasks. Read their output. That's it.
+Spawn Claude Code, Codex, Pi, Aider, or any coding agent in tmux panes. Monitor them. Send them tasks. Read their output. Track tickets with [beads](https://github.com/steveyegge/beads). That's it.
 
 ```bash
-turbomux spawn backend ~/projects/app "Fix the auth bug"
-turbomux spawn frontend ~/projects/app "Add dark mode"
-turbomux status          # who's idle, who's working
-turbomux peek 0:1.0      # what did the agent just do?
-turbomux send 0:1.0 "Now write tests"
+turbomux init                    # init beads ticket tracker
+turbomux spawn backend ~/app "Fix the auth bug"
+turbomux spawn frontend ~/app "Add dark mode"
+turbomux status                  # panes + ready tickets
+turbomux ready                   # what's unblocked?
+turbomux assign slate-mjm 0:1.0  # assign ticket to agent
+turbomux peek 0:1.0              # what's the agent doing?
 ```
 
 No YAML pipelines. No agent frameworks. No LangChain. Just terminals doing work.
+
+Powered by [beads](https://github.com/steveyegge/beads) — the agent-native issue tracker built on [Dolt](https://github.com/dolthub/dolt) (git for data). Tickets track dependencies, agents claim work atomically, and all worktrees share one database. Or skip beads entirely and use your own system (Linear, ClickUp, nothing).
+
+---
 
 ## Install
 
@@ -25,117 +31,180 @@ Or build from source:
 git clone https://github.com/epuerta9/turbomux.git
 cd turbomux
 go build -o turbomux .
-cp turbomux ~/.local/bin/  # or /usr/local/bin/
+cp turbomux ~/.local/bin/
 ```
+
+### Optional: Install beads + dolt for ticket tracking
+```bash
+# Dolt (git-for-data SQL database)
+brew install dolt            # macOS
+# or: https://docs.dolthub.com/introduction/installation
+
+# Beads (agent-native issue tracker)
+go install github.com/steveyegge/beads/cmd/bd@latest
+```
+
+Without beads, turbomux is pure tmux orchestration. With beads, you get dependency-aware ticket tracking that all your agents share.
+
+---
 
 ## Quick Start
 
-```bash
-# See what's running
-turbomux list
+### Without beads (pure tmux)
 
-# Check agent status (idle vs working)
+```bash
+# Spawn agents
+turbomux spawn backend ~/projects/app "Fix the auth bug"
+turbomux spawn frontend ~/projects/app "Add dark mode"
+
+# Monitor
 turbomux status
-
-# Spawn a new agent in a directory
-turbomux spawn backend ~/projects/my-app "Fix the auth bug in src/auth.ts"
-
-# Read what an agent is doing
 turbomux peek 0:1.0
-turbomux peek 0:1.0 100     # last 100 lines
-turbomux history 0:1.0       # full scrollback
 
-# Send a follow-up instruction to an idle agent
-turbomux send 0:1.0 "Now write tests for the auth fix"
-
-# Force-send even if agent looks busy
-turbomux send -f 0:1.0 "Stop and focus on the login bug instead"
-
-# Create a window with 3 agent panes
-turbomux window agents 3
-
-# Kill a pane
-turbomux kill 0:2.1
-
-# Send special keys (navigate menus, confirm prompts, interrupt)
-turbomux keys 0:1.0 Down Down Enter    # navigate a selector
-turbomux keys 0:1.0 y Enter            # confirm a yes/no prompt
-turbomux keys 0:1.0 C-c                # ctrl+c to interrupt
+# Send follow-up
+turbomux send 0:1.0 "Now write tests"
 ```
 
-## Agent Configuration
-
-By default, turbomux launches `claude --dangerously-skip-permissions`. Change this in your config:
+### With beads (ticket tracking)
 
 ```bash
-mkdir -p ~/.config/turbomux
-cat > ~/.config/turbomux/config.yaml << 'EOF'
-# Default coding agent
-agent: claude-yolo
+# Init beads in your project
+cd ~/projects/my-app
+turbomux init
 
-# Built-in agents:
-#   claude-yolo  = claude --dangerously-skip-permissions (default)
-#   claude       = claude (with permission prompts)
-#   codex        = codex
-#   pi           = pi
-#   aider        = aider
-# Or any custom command:
-#   agent: "my-agent --custom-flag"
+# Create tickets
+bd create "Auth middleware rewrite" --type task --priority 1
+bd create "Add rate limiting" --type task --priority 2
+bd create "Integration tests" --type task --priority 2
+bd dep add <test-id> <auth-id>    # tests depend on auth
 
-# tmux session name
-session: "0"
+# See what's ready
+turbomux ready
+# → auth and rate-limiting are ready (no blockers)
+# → tests are blocked (waiting on auth)
 
-# Default window name for spawned agents
-default_window: agents
+# Spawn agents — beads auto-creates worktrees with shared DB
+turbomux spawn auth ~/projects/my-app "Run bd ready, claim a ticket with bd update <id> --claim, and start working"
+turbomux spawn api ~/projects/my-app "Run bd ready, claim a ticket, start working"
 
-# Pane layout: tiled, even-horizontal, even-vertical, main-horizontal, main-vertical
-layout: tiled
-EOF
+# Both agents see the same tickets, claim atomically (no race conditions)
+
+# Monitor everything
+turbomux status
+# 🔨 working  0:1.0  auth agent
+# 🔨 working  0:1.1  api agent
+# 📋 Ready tickets:
+# ○ slate-q5y  P2  Integration tests (blocked by auth)
+
+# When auth finishes, tests auto-unblock
+turbomux ready
+# → Integration tests is now ready!
+
+# Assign it
+turbomux assign <test-id> 0:1.0
 ```
 
-Override per-spawn:
-```bash
-turbomux spawn --agent=codex backend ~/projects/app "Fix the bug"
-turbomux spawn --agent=pi frontend ~/projects/web "Add dark mode"
-turbomux spawn --agent="aider --model gpt-4" refactor ~/projects/lib
-```
+---
 
 ## Commands
+
+### Tmux Orchestration
 
 | Command | Description |
 |---------|-------------|
 | `turbomux list` | List all tmux panes with idle/working status |
-| `turbomux status` | Show only agent panes with status summary |
+| `turbomux status` | Agent panes + beads ready/blocked summary |
 | `turbomux peek <pane> [lines]` | Read last N lines of a pane (default 30) |
 | `turbomux history <pane>` | Dump entire scrollback buffer |
-| `turbomux send [-f] <pane> <msg>` | Send input to a pane (checks idle first) |
-| `turbomux spawn [--agent=X] <name> <dir> [prompt]` | Create pane, launch agent, send prompt |
+| `turbomux send [-f] <pane> <msg>` | Send input to a pane (checks idle first, `-f` to force) |
+| `turbomux spawn [--agent=X] <name> <dir> [prompt]` | Create pane, launch agent, optionally send prompt |
 | `turbomux window <name> <count>` | Create named window with N panes |
 | `turbomux kill <pane>` | Kill a pane or window |
 | `turbomux keys <pane> <key...>` | Send special keys (Enter, Up, Down, C-c, etc.) |
 | `turbomux config` | Show current configuration |
 | `turbomux json` | Machine-readable JSON of all panes |
 
+### Ticket Tracking (beads)
+
+| Command | Description |
+|---------|-------------|
+| `turbomux init [dir]` | Initialize beads in a project (`bd init`) |
+| `turbomux tickets` | List all open tickets (`bd list`) |
+| `turbomux board` | Board overview with counts (`bd status`) |
+| `turbomux ready` | Show unblocked tickets ready for work (`bd ready`) |
+| `turbomux assign <ticket> <pane>` | Claim ticket + send details to an agent |
+
+---
+
+## Agent Configuration
+
+```yaml
+# ~/.config/turbomux/config.yaml
+
+# Default coding agent
+agent: claude-yolo    # claude --dangerously-skip-permissions
+
+# Built-in agents:
+#   claude-yolo  = claude --dangerously-skip-permissions
+#   claude       = claude (with permission prompts)
+#   codex        = codex
+#   pi           = pi
+#   aider        = aider
+# Or any command: agent: "my-tool --flag"
+
+# Ticket tracker: "beads" (default) or "none"
+# beads: turbomux spawn auto-creates worktrees with shared ticket DB
+# none: pure tmux, coordinate however you want (Linear, ClickUp, etc.)
+tracker: beads
+
+# Pane layout: tiled, even-horizontal, even-vertical
+layout: tiled
+```
+
+Override per-spawn:
+```bash
+turbomux spawn --agent=codex backend ~/app "Fix the bug"
+turbomux spawn --no-tracker worker ~/app "Just code, no tickets"
+```
+
+---
+
+## How Beads Integration Works
+
+[Beads](https://github.com/steveyegge/beads) is a Go CLI issue tracker by Steve Yegge, built on [Dolt](https://github.com/dolthub/dolt) (a MySQL database with git semantics). It's designed for AI agents — hash-based IDs, dependency graphs, atomic claim, memory decay.
+
+When you `turbomux spawn` with `tracker: beads`, turbomux:
+
+1. Checks if the target directory has a `.beads/` database
+2. Creates a git worktree via `bd worktree create` (not `git worktree add`)
+3. The worktree gets a `.beads/redirect` file pointing to the main project's database
+4. **All worktrees share one ticket database** — agents in different worktrees see the same tickets
+5. Agents use `bd ready` to find work, `bd update --claim` to take a ticket, `bd note` to log progress, `bd close` when done
+
+No race conditions. Two agents can't claim the same ticket — `bd update --claim` is an atomic SQL operation.
+
+### Don't want beads?
+
+Set `tracker: none` in config. turbomux becomes pure tmux orchestration — no opinions on how you track work. Use Linear MCP, ClickUp, GitHub Issues, or nothing at all.
+
+---
+
 ## Interactive Prompt Handling
 
 When spawning agents, turbomux auto-handles common startup prompts:
 
 - **"Do you trust this project directory?"** → auto-accepts
-- **"Select account"** → selects the default (first) option
+- **"Select account"** → selects the default option
 - **Yes/No confirmations** → auto-confirms
-- **"Press enter to continue"** → presses enter
 
-For anything else, use `turbomux keys` to navigate manually:
+For anything else:
 ```bash
-# Navigate a dropdown selector
-turbomux keys 0:1.0 Down Down Enter
-
-# Dismiss a dialog
-turbomux keys 0:1.0 Escape
-
-# Type into an interactive prompt
-turbomux keys 0:1.0 m y p a s s w o r d Enter
+turbomux keys 0:1.0 Down Down Enter    # navigate a selector
+turbomux keys 0:1.0 Escape             # dismiss a dialog
+turbomux keys 0:1.0 C-c                # ctrl+c to interrupt
 ```
+
+---
 
 ## Pane Targeting
 
@@ -144,47 +213,53 @@ Use tmux target syntax:
 - `agents.0` — window named "agents", pane 0
 - `agents` — the window itself (for `kill`)
 
-## How It Works
+---
 
-turbomux wraps tmux commands to manage AI coding agents:
+## Claude Code Skill
 
-- **`list`/`status`** — Uses `tmux list-panes` + `tmux capture-pane` to detect idle agents (looks for `❯` prompt for Claude Code, `codex>` for Codex, `$` for shell)
-- **`peek`/`history`** — Uses `tmux capture-pane -p -S -N` to read scrollback
-- **`send`** — Uses `tmux send-keys` to type into panes. Checks idle state first to avoid interrupting working agents
-- **`spawn`** — Uses `tmux split-window` + `send-keys` to create a pane, cd to a directory, launch the configured agent, and optionally send an opening prompt
-- **`window`** — Uses `tmux new-window` + `split-window` + `select-layout` to create multi-pane layouts
-
-## Use with Claude Code (as a skill)
-
-turbomux includes a Claude Code skill so Claude can orchestrate agents:
+turbomux includes a Claude Code skill at `.claude/commands/turbomux.md`. Install globally:
 
 ```bash
-# Copy the skill to your Claude Code config
-cp skill-turbomux.md ~/.claude/commands/turbomux.md
+cp .claude/commands/turbomux.md ~/.claude/commands/turbomux.md
 ```
 
-Then in Claude Code: `/turbomux status` or ask Claude to "check on my agents" and it will use turbomux.
+Then any Claude Code session can use `/turbomux` or ask Claude to "check on my agents."
 
-## Example: Multi-Agent Workflow
+---
+
+## Example: Full Multi-Agent Sprint
 
 ```bash
-# 1. Create worktrees for parallel work
+# 1. Init project with beads
 cd ~/projects/my-app
-git worktree add ../my-app-agent-a -b feature/auth
-git worktree add ../my-app-agent-b -b feature/api
-git worktree add ../my-app-agent-c -b feature/ui
+turbomux init
 
-# 2. Create a 3-pane window
-turbomux window agents 3
+# 2. Create tickets with dependencies
+bd create "Database schema migration" --type task -p 1
+bd create "API endpoints for users" --type task -p 1
+bd create "Frontend user dashboard" --type task -p 2
+bd create "E2E tests" --type task -p 2
+bd dep add <api-id> <db-id>         # API depends on DB
+bd dep add <frontend-id> <api-id>    # frontend depends on API
+bd dep add <e2e-id> <frontend-id>    # E2E depends on frontend
 
-# 3. Spawn agents with their briefs
-turbomux spawn auth ~/projects/my-app-agent-a "Read AGENTS.md and start on the auth ticket"
-turbomux spawn api ~/projects/my-app-agent-b "Read AGENTS.md and start on the API ticket"
-turbomux spawn ui ~/projects/my-app-agent-c "Read AGENTS.md and start on the UI ticket"
+# 3. Check the ready frontier
+turbomux ready
+# → Only "Database schema migration" is ready (everything else is blocked)
 
-# 4. Monitor
+# 4. Spawn agents
+turbomux spawn db-agent ~/projects/my-app "Run bd ready and start on the database migration"
+turbomux spawn api-agent ~/projects/my-app "Run bd ready — if nothing is ready, wait. Check back with bd ready periodically."
+
+# 5. As DB migration completes, API ticket auto-unblocks
+# api-agent can now claim it
+
+# 6. Monitor from your main session
 turbomux status
+turbomux board
+turbomux peek 0:1.0 50
 
-# 5. Send follow-ups as they finish
-turbomux send agents.0 "Auth looks good, now write integration tests"
+# 7. When everything's done
+bd list --status closed    # see what was accomplished
+bd status                  # sprint summary
 ```
