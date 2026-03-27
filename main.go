@@ -8,19 +8,19 @@ import (
 	"strings"
 )
 
-const usage = `conductor — tmux agent orchestrator
+const usage = `turbomux — tmux agent orchestrator
 
 Usage:
-  conductor list                          List all tmux panes with status
-  conductor peek <pane>                   Show last N lines of a pane (default 30)
-  conductor peek <pane> <lines>           Show last N lines of a pane
-  conductor history <pane>                Dump entire scrollback buffer
-  conductor send <pane> <message...>      Send input to a pane
+  turbomux list                          List all tmux panes with status
+  turbomux peek <pane>                   Show last N lines of a pane (default 30)
+  turbomux peek <pane> <lines>           Show last N lines of a pane
+  turbomux history <pane>                Dump entire scrollback buffer
+  turbomux send <pane> <message...>      Send input to a pane
   conductor status                        Check all agent panes (idle/working)
-  conductor spawn <name> <dir> [prompt]   Create a pane, cd to dir, launch cc, optionally send prompt
-  conductor window <name> <count>         Create a named window with N panes
-  conductor kill <pane>                   Kill a pane
-  conductor json                          Output all pane status as JSON
+  turbomux spawn <name> <dir> [prompt]   Create a pane, cd to dir, launch cc, optionally send prompt
+  turbomux window <name> <count>         Create a named window with N panes
+  turbomux kill <pane>                   Kill a pane
+  turbomux json                          Output all pane status as JSON
 
 Pane targeting:
   Use tmux target syntax: "session:window.pane" or just "window.pane" or window name.
@@ -160,7 +160,7 @@ func cmdList() {
 
 func cmdPeek(args []string) {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: conductor peek <pane> [lines]")
+		fmt.Fprintln(os.Stderr, "usage: turbomux peek <pane> [lines]")
 		os.Exit(1)
 	}
 	target := args[0]
@@ -179,7 +179,7 @@ func cmdPeek(args []string) {
 
 func cmdHistory(args []string) {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: conductor history <pane>")
+		fmt.Fprintln(os.Stderr, "usage: turbomux history <pane>")
 		os.Exit(1)
 	}
 	target := args[0]
@@ -195,7 +195,7 @@ func cmdHistory(args []string) {
 
 func cmdSend(args []string) {
 	if len(args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: conductor send <pane> <message...>")
+		fmt.Fprintln(os.Stderr, "usage: turbomux send <pane> <message...>")
 		os.Exit(1)
 	}
 	target := args[0]
@@ -254,7 +254,7 @@ func cmdStatus() {
 
 func cmdSpawn(args []string) {
 	if len(args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: conductor spawn <name> <dir> [prompt]")
+		fmt.Fprintln(os.Stderr, "usage: turbomux spawn <name> <dir> [prompt]")
 		os.Exit(1)
 	}
 	name := args[0]
@@ -281,13 +281,13 @@ func cmdSpawn(args []string) {
 	// If a prompt was provided, wait a moment then send it
 	if len(args) > 2 {
 		prompt := strings.Join(args[2:], " ")
-		fmt.Printf("prompt queued — will need to be sent after cc starts: conductor send %s \"%s\"\n", target, prompt)
+		fmt.Printf("prompt queued — will need to be sent after cc starts: turbomux send %s \"%s\"\n", target, prompt)
 	}
 }
 
 func cmdWindow(args []string) {
 	if len(args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: conductor window <name> <count>")
+		fmt.Fprintln(os.Stderr, "usage: turbomux window <name> <count>")
 		os.Exit(1)
 	}
 	name := args[0]
@@ -322,7 +322,7 @@ func cmdWindow(args []string) {
 
 func cmdKill(args []string) {
 	if len(args) < 1 {
-		fmt.Fprintln(os.Stderr, "usage: conductor kill <pane>")
+		fmt.Fprintln(os.Stderr, "usage: turbomux kill <pane>")
 		os.Exit(1)
 	}
 	target := args[0]
