@@ -1,6 +1,18 @@
 # turbomux
 
-tmux agent orchestrator — spawn, monitor, and command AI coding agents across tmux panes.
+Dead simple coding agent orchestration. No framework, no server, no SDK — just tmux.
+
+Spawn Claude Code, Codex, Pi, Aider, or any coding agent in tmux panes. Monitor them. Send them tasks. Read their output. That's it.
+
+```bash
+turbomux spawn backend ~/projects/app "Fix the auth bug"
+turbomux spawn frontend ~/projects/app "Add dark mode"
+turbomux status          # who's idle, who's working
+turbomux peek 0:1.0      # what did the agent just do?
+turbomux send 0:1.0 "Now write tests"
+```
+
+No YAML pipelines. No agent frameworks. No LangChain. Just terminals doing work.
 
 ## Install
 
