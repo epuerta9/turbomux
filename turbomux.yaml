@@ -1,0 +1,16 @@
+# turbomux configuration
+# Place at ~/.config/turbomux/config.yaml or ./turbomux.yaml
+
+# Default coding agent command to launch in new panes
+# Options: "cc" (claude --dangerously-skip-permissions), "claude", "codex", "pi", custom command
+agent: cc
+
+# Session name for agent windows
+session: "0"
+
+# Default window name for spawned agents
+default_window: agents
+
+# Pane layout when creating multi-pane windows
+# Options: tiled, even-horizontal, even-vertical, main-horizontal, main-vertical
+layout: tiled

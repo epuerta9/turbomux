@@ -5,27 +5,97 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
+	"time"
+
+	"gopkg.in/yaml.v3"
 )
 
 const usage = `turbomux — tmux agent orchestrator
 
 Usage:
-  turbomux list                          List all tmux panes with status
-  turbomux peek <pane>                   Show last N lines of a pane (default 30)
-  turbomux peek <pane> <lines>           Show last N lines of a pane
-  turbomux history <pane>                Dump entire scrollback buffer
-  turbomux send <pane> <message...>      Send input to a pane
-  conductor status                        Check all agent panes (idle/working)
-  turbomux spawn <name> <dir> [prompt]   Create a pane, cd to dir, launch cc, optionally send prompt
-  turbomux window <name> <count>         Create a named window with N panes
-  turbomux kill <pane>                   Kill a pane
-  turbomux json                          Output all pane status as JSON
+  turbomux list                              List all tmux panes with status
+  turbomux peek <pane> [lines]               Show last N lines (default 30)
+  turbomux history <pane>                    Dump entire scrollback buffer
+  turbomux send [-f] <pane> <message...>     Send input to a pane (-f to skip idle check)
+  turbomux status                            Check all agent panes (idle/working)
+  turbomux spawn <name> <dir> [prompt]       Create pane, cd to dir, launch agent, send prompt
+  turbomux spawn --agent=codex <name> <dir>  Use a specific agent (overrides config)
+  turbomux window <name> <count>             Create named window with N panes
+  turbomux kill <pane>                       Kill a pane or window
+  turbomux config                            Show current configuration
+  turbomux json                              Output all pane status as JSON
+
+Agents:
+  The default agent is set in config (~/.config/turbomux/config.yaml).
+  Override per-spawn with --agent=<name>. Built-in agents:
+    cc       claude --dangerously-skip-permissions (default)
+    claude   claude (with permission prompts)
+    codex    codex
+    pi       pi
+    aider    aider
+  Or use any custom command: --agent="my-custom-agent --flag"
 
 Pane targeting:
-  Use tmux target syntax: "session:window.pane" or just "window.pane" or window name.
+  Use tmux target syntax: "session:window.pane", "window.pane", or window name.
   Examples: "0:1.0", "agents.0", "agents.1"
+
+Config:
+  Place config at ~/.config/turbomux/config.yaml or ./turbomux.yaml
 `
+
+type Config struct {
+	Agent         string `yaml:"agent"`
+	Session       string `yaml:"session"`
+	DefaultWindow string `yaml:"default_window"`
+	Layout        string `yaml:"layout"`
+}
+
+var defaultConfig = Config{
+	Agent:         "cc",
+	Session:       "0",
+	DefaultWindow: "agents",
+	Layout:        "tiled",
+}
+
+func loadConfig() Config {
+	cfg := defaultConfig
+
+	// Try local first, then global
+	paths := []string{
+		"turbomux.yaml",
+		filepath.Join(os.Getenv("HOME"), ".config", "turbomux", "config.yaml"),
+	}
+
+	for _, p := range paths {
+		data, err := os.ReadFile(p)
+		if err != nil {
+			continue
+		}
+		yaml.Unmarshal(data, &cfg)
+		break
+	}
+
+	return cfg
+}
+
+func resolveAgent(name string) string {
+	switch name {
+	case "cc":
+		return "claude --dangerously-skip-permissions"
+	case "claude":
+		return "claude"
+	case "codex":
+		return "codex"
+	case "pi":
+		return "pi"
+	case "aider":
+		return "aider"
+	default:
+		return name // custom command
+	}
+}
 
 func main() {
 	if len(os.Args) < 2 {
@@ -53,6 +123,8 @@ func main() {
 		cmdWindow(args)
 	case "kill":
 		cmdKill(args)
+	case "config":
+		cmdConfig()
 	case "json":
 		cmdJSON()
 	case "help", "-h", "--help":
@@ -67,13 +139,6 @@ func main() {
 func tmux(args ...string) (string, error) {
 	out, err := exec.Command("tmux", args...).CombinedOutput()
 	return strings.TrimSpace(string(out)), err
-}
-
-func tmuxRun(args ...string) error {
-	cmd := exec.Command("tmux", args...)
-	cmd.Stdout = os.Stdout
-	cmd.Stderr = os.Stderr
-	return cmd.Run()
 }
 
 type PaneInfo struct {
@@ -115,20 +180,25 @@ func listPanes() []PaneInfo {
 }
 
 func isIdle(target string) bool {
-	out, _ := tmux("capture-pane", "-t", target, "-p", "-S", "-5")
+	out, _ := tmux("capture-pane", "-t", target, "-p", "-S", "-10")
 	lines := strings.Split(out, "\n")
 	for i := len(lines) - 1; i >= 0; i-- {
 		line := strings.TrimSpace(lines[i])
 		if line == "" {
 			continue
 		}
-		// Claude Code shows ❯ when idle at prompt
+		// Claude Code idle prompt
 		if strings.Contains(line, "❯") && !strings.Contains(line, "tokens") {
 			return true
 		}
-		// If we see activity indicators, it's working
+		// Codex idle prompt
+		if strings.Contains(line, "codex>") || strings.Contains(line, "$ ") {
+			return true
+		}
+		// Active work indicators
 		if strings.Contains(line, "⏺") || strings.Contains(line, "✻") ||
-			strings.Contains(line, "◼") || strings.Contains(line, "⎿") {
+			strings.Contains(line, "◼") || strings.Contains(line, "⎿") ||
+			strings.Contains(line, "Thinking") {
 			return false
 		}
 		break
@@ -183,8 +253,6 @@ func cmdHistory(args []string) {
 		os.Exit(1)
 	}
 	target := args[0]
-
-	// -S - means start of history, -E means end
 	out, err := tmux("capture-pane", "-t", target, "-p", "-S", "-")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error: %s\n", out)
@@ -194,16 +262,26 @@ func cmdHistory(args []string) {
 }
 
 func cmdSend(args []string) {
+	force := false
+	filtered := []string{}
+	for _, a := range args {
+		if a == "-f" || a == "--force" {
+			force = true
+		} else {
+			filtered = append(filtered, a)
+		}
+	}
+	args = filtered
+
 	if len(args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: turbomux send <pane> <message...>")
+		fmt.Fprintln(os.Stderr, "usage: turbomux send [-f] <pane> <message...>")
 		os.Exit(1)
 	}
 	target := args[0]
 	message := strings.Join(args[1:], " ")
 
-	// Check if pane is idle before sending
-	if !isIdle(target) {
-		fmt.Fprintf(os.Stderr, "warning: pane %s appears to be busy (not at ❯ prompt)\n", target)
+	if !force && !isIdle(target) {
+		fmt.Fprintf(os.Stderr, "warning: pane %s appears to be busy (not at prompt)\n", target)
 		fmt.Fprintf(os.Stderr, "send anyway? [y/N] ")
 		var confirm string
 		fmt.Scanln(&confirm)
@@ -228,12 +306,26 @@ func cmdStatus() {
 	working := 0
 
 	for _, p := range panes {
-		// Only show claude-related panes
-		if p.Command != "2.1.85" && !strings.Contains(p.Title, "claude") &&
-			!strings.Contains(p.Title, "Claude") && !strings.Contains(p.Title, "agent") &&
-			!strings.Contains(p.Title, "Implement") && !strings.Contains(p.Title, "Build") {
+		// Heuristic: detect agent panes by command or title
+		isAgent := false
+		agentCmds := []string{"claude", "codex", "pi", "aider", "2.1"}
+		for _, ac := range agentCmds {
+			if strings.Contains(strings.ToLower(p.Command), ac) {
+				isAgent = true
+				break
+			}
+		}
+		agentTitles := []string{"claude", "Claude", "agent", "Agent", "Implement", "Build", "Fix", "Create", "Add", "Update", "Refactor"}
+		for _, at := range agentTitles {
+			if strings.Contains(p.Title, at) {
+				isAgent = true
+				break
+			}
+		}
+		if !isAgent {
 			continue
 		}
+
 		agents++
 		status := "🔨 working"
 		if p.Idle {
@@ -253,17 +345,42 @@ func cmdStatus() {
 }
 
 func cmdSpawn(args []string) {
+	cfg := loadConfig()
+	agentOverride := ""
+
+	// Parse --agent flag
+	filtered := []string{}
+	for _, a := range args {
+		if strings.HasPrefix(a, "--agent=") {
+			agentOverride = strings.TrimPrefix(a, "--agent=")
+		} else {
+			filtered = append(filtered, a)
+		}
+	}
+	args = filtered
+
 	if len(args) < 2 {
-		fmt.Fprintln(os.Stderr, "usage: turbomux spawn <name> <dir> [prompt]")
+		fmt.Fprintln(os.Stderr, "usage: turbomux spawn [--agent=<name>] <name> <dir> [prompt]")
 		os.Exit(1)
 	}
 	name := args[0]
 	dir := args[1]
 
-	// Create a new pane in the current window by splitting
+	// Expand ~ in dir
+	if strings.HasPrefix(dir, "~/") {
+		dir = filepath.Join(os.Getenv("HOME"), dir[2:])
+	}
+
+	// Resolve which agent to use
+	agent := cfg.Agent
+	if agentOverride != "" {
+		agent = agentOverride
+	}
+	agentCmd := resolveAgent(agent)
+
+	// Create a new pane by splitting, or a new window if split fails
 	_, err := tmux("split-window", "-h", "-c", dir)
 	if err != nil {
-		// Try creating a new window instead
 		_, err = tmux("new-window", "-n", name, "-c", dir)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error creating pane: %v\n", err)
@@ -271,21 +388,35 @@ func cmdSpawn(args []string) {
 		}
 	}
 
-	// Get the newly created pane target
+	// Get the newly created pane
 	target, _ := tmux("display-message", "-p", "#{session_name}:#{window_index}.#{pane_index}")
 
-	// Launch claude
-	tmux("send-keys", "-t", target, "cc", "Enter")
-	fmt.Printf("spawned agent in %s (dir: %s)\n", target, dir)
+	// Launch the agent
+	tmux("send-keys", "-t", target, agentCmd, "Enter")
+	fmt.Printf("spawned %s in %s (dir: %s, agent: %s)\n", name, target, dir, agent)
 
-	// If a prompt was provided, wait a moment then send it
+	// If prompt provided, wait for agent to start then send it
 	if len(args) > 2 {
 		prompt := strings.Join(args[2:], " ")
-		fmt.Printf("prompt queued — will need to be sent after cc starts: turbomux send %s \"%s\"\n", target, prompt)
+		fmt.Printf("waiting for agent to start...")
+		// Poll for idle state (agent ready for input)
+		for i := 0; i < 30; i++ {
+			time.Sleep(2 * time.Second)
+			if isIdle(target) {
+				fmt.Println(" ready!")
+				tmux("send-keys", "-t", target, prompt, "Enter")
+				fmt.Printf("sent prompt to %s\n", target)
+				return
+			}
+			fmt.Print(".")
+		}
+		fmt.Println(" timeout — send prompt manually:")
+		fmt.Printf("  turbomux send %s \"%s\"\n", target, prompt)
 	}
 }
 
 func cmdWindow(args []string) {
+	cfg := loadConfig()
 	if len(args) < 2 {
 		fmt.Fprintln(os.Stderr, "usage: turbomux window <name> <count>")
 		os.Exit(1)
@@ -294,14 +425,12 @@ func cmdWindow(args []string) {
 	count := 1
 	fmt.Sscanf(args[1], "%d", &count)
 
-	// Create the window
 	_, err := tmux("new-window", "-n", name)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "error creating window: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Split into the requested number of panes
 	for i := 1; i < count; i++ {
 		if i%2 == 1 {
 			tmux("split-window", "-t", name, "-h")
@@ -310,12 +439,10 @@ func cmdWindow(args []string) {
 		}
 	}
 
-	// Even out the layout
-	tmux("select-layout", "-t", name, "tiled")
+	layout := cfg.Layout
+	tmux("select-layout", "-t", name, layout)
 
-	fmt.Printf("created window '%s' with %d panes\n", name, count)
-
-	// List the new panes
+	fmt.Printf("created window '%s' with %d panes (layout: %s)\n", name, count, layout)
 	out, _ := tmux("list-panes", "-t", name, "-F", "  #{session_name}:#{window_index}.#{pane_index}")
 	fmt.Println(out)
 }
@@ -328,7 +455,6 @@ func cmdKill(args []string) {
 	target := args[0]
 	_, err := tmux("kill-pane", "-t", target)
 	if err != nil {
-		// Try as window
 		_, err = tmux("kill-window", "-t", target)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "error killing %s\n", target)
@@ -338,6 +464,14 @@ func cmdKill(args []string) {
 		return
 	}
 	fmt.Printf("killed pane %s\n", target)
+}
+
+func cmdConfig() {
+	cfg := loadConfig()
+	fmt.Printf("agent:          %s → %s\n", cfg.Agent, resolveAgent(cfg.Agent))
+	fmt.Printf("session:        %s\n", cfg.Session)
+	fmt.Printf("default_window: %s\n", cfg.DefaultWindow)
+	fmt.Printf("layout:         %s\n", cfg.Layout)
 }
 
 func cmdJSON() {
